@@ -114,22 +114,22 @@ jobs:
           key: pte-cache-${{ env.CCACHE_KEY }}
 
       # 6. 编译 pte_driver 独立模块 (.ko) —— 每次都会执行
+      # 关键：M= 模块目录必须放在内核树(kernel_workspace/common)之外，
+      #       否则 kbuild 无法为 .ko 生成链接规则，报 "No rule to make target X.ko"
       - name: 编译 pte_driver 独立模块 (.ko)
         run: |
-          cd kernel_workspace/common
           echo "=== 准备模块编译环境 ==="
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang18/bin:$PATH"
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/build-tools/build-tools/bin:$PATH"
           export PATH="/usr/lib/ccache:$PATH"
-          # 复制 pte_driver 源码到内核树内（仓库默认 checkout 在 $GITHUB_WORKSPACE）
-          # 先清除可能随缓存恢复的旧编译残留（.o/.mod），避免链接规则混乱导致 No rule to make target
-          rm -rf ./pte_driver_mod
-          cp -r $GITHUB_WORKSPACE/pte_driver ./pte_driver_mod
+          # 模块源码放内核树外：$GITHUB_WORKSPACE/pte_driver_mod（绝对路径）
+          rm -rf $GITHUB_WORKSPACE/pte_driver_mod
+          cp -r $GITHUB_WORKSPACE/pte_driver $GITHUB_WORKSPACE/pte_driver_mod
           echo "=== 编译 pte_driver.ko ==="
-          make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$(pwd)/pte_driver_mod modules 2>&1 | tail -30
+          make -C $GITHUB_WORKSPACE/kernel_workspace/common LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$GITHUB_WORKSPACE/pte_driver_mod modules 2>&1 | tail -60
           echo "=== 产物检查 ==="
-          ls -la ./pte_driver_mod/*.ko 2>&1
-          cp -f ./pte_driver_mod/pte_driver.ko $GITHUB_WORKSPACE/ 2>/dev/null || true
+          find $GITHUB_WORKSPACE/pte_driver_mod -maxdepth 2 -name '*.ko' -exec ls -la {} \; 2>&1
+          cp -f $GITHUB_WORKSPACE/pte_driver_mod/pte_driver.ko $GITHUB_WORKSPACE/ 2>/dev/null || true
 
       # 7. 上传 pte_driver.ko
       - name: 上传 pte_driver.ko
