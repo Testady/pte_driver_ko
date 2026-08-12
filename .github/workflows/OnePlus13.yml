@@ -65,8 +65,11 @@ jobs:
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
           export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/build-tools/bin:$PATH"
           cd kernel_workspace/common
+          # 设置与设备一致的 LOCALVERSION（确保 .ko vermagic 精确匹配设备内核）
+          echo "CONFIG_LOCALVERSION=\"-android15-8-g29d86c5fc9dd-abogki428889875-4k\"" >> ./arch/arm64/configs/gki_defconfig
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> ./arch/arm64/configs/gki_defconfig
           make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
 
       # 3. 编译完整 GKI 内核（生成完整 Module.symvers，确保 .ko 符号版本与设备一致）
@@ -75,7 +78,7 @@ jobs:
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
           export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/build-tools/bin:$PATH"
           cd kernel_workspace/common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
 
