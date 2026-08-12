@@ -125,23 +125,19 @@ jobs:
           # 模块源码放内核树外：$GITHUB_WORKSPACE/pte_driver_mod（绝对路径）
           rm -rf $GITHUB_WORKSPACE/pte_driver_mod
           cp -r $GITHUB_WORKSPACE/pte_driver $GITHUB_WORKSPACE/pte_driver_mod
-          # 清理内核 out 中缓存的内核自身的 modules.*/.tmp_versions 元数据，
-          # 避免这些残留干扰外部模块的 .ko 链接规则（__modfinal 找不到 X.ko）
-          rm -f $GITHUB_WORKSPACE/kernel_workspace/common/out/modules.order
-          rm -f $GITHUB_WORKSPACE/kernel_workspace/common/out/modules.builtin
-          rm -f $GITHUB_WORKSPACE/kernel_workspace/common/out/modules.stamp
-          rm -f $GITHUB_WORKSPACE/kernel_workspace/common/out/modules.builtin.modinfo
-          rm -rf $GITHUB_WORKSPACE/kernel_workspace/common/out/.tmp_versions
           # pipefail：让 make 的真实失败码被 step 捕获（否则 run 会假成功）
           set -o pipefail
           echo "=== 编译 pte_driver.ko ==="
-          make -C $GITHUB_WORKSPACE/kernel_workspace/common LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$GITHUB_WORKSPACE/pte_driver_mod modules 2>&1 | tee /tmp/mod_build.log | tail -80
-          echo "=== 完整 make 输出（尾部）==="
-          tail -120 /tmp/mod_build.log
-          echo "=== M目录生成的 .ko ==="
-          find $GITHUB_WORKSPACE/pte_driver_mod -maxdepth 3 -name '*.ko' -exec ls -la {} \; 2>&1
-          echo "=== M目录 .mod / modules.order / .tmp_versions ==="
-          find $GITHUB_WORKSPACE/pte_driver_mod \( -name '*.mod' -o -name 'modules.order' -o -name '.tmp_versions' \) 2>&1 | head -20
+          make -C $GITHUB_WORKSPACE/kernel_workspace/common LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$GITHUB_WORKSPACE/pte_driver_mod modules 2>&1 | tee /tmp/mod_build.log
+          echo "=== make 退出码管道处理 ==="
+          echo "=== 完整 make 输出 ==="
+          cat /tmp/mod_build.log
+          echo "=== M目录全部文件 ==="
+          ls -la $GITHUB_WORKSPACE/pte_driver_mod/ 2>&1
+          echo "=== M目录 .mod / .mod.c / modules.order / .ko ==="
+          find $GITHUB_WORKSPACE/pte_driver_mod \( -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' -o -name 'modules.order' -o -name 'Module.symvers' \) 2>&1
+          echo "=== out/scripts/module.lds ==="
+          ls -la $GITHUB_WORKSPACE/kernel_workspace/common/out/scripts/module.lds 2>&1
           cp -f $GITHUB_WORKSPACE/pte_driver_mod/pte_driver.ko $GITHUB_WORKSPACE/ 2>/dev/null || true
 
       # 7. 上传 pte_driver.ko
