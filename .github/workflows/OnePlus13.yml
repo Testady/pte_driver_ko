@@ -136,6 +136,16 @@ jobs:
           ls -la $GITHUB_WORKSPACE/pte_driver_mod/ 2>&1
           echo "=== M目录 .mod / .mod.c / modules.order / .ko ==="
           find $GITHUB_WORKSPACE/pte_driver_mod \( -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' -o -name 'modules.order' -o -name 'Module.symvers' \) 2>&1
+          echo "=== DIAG out 下 pte_driver_mod (obj 错位检查) ==="
+          find $GITHUB_WORKSPACE/kernel_workspace/common/out \( -path '*pte_driver_mod*' -o -name '*.mod.c' -o -name '*.mod.o' \) 2>/dev/null | head -20
+          echo "=== DIAG out/modules.order 内容 ==="
+          cat $GITHUB_WORKSPACE/kernel_workspace/common/out/modules.order 2>&1 | head -20
+          echo "=== DIAG out/.tmp_versions ==="
+          ls -la $GITHUB_WORKSPACE/kernel_workspace/common/out/.tmp_versions 2>&1 | head -10
+          echo "=== DIAG M/.tmp_versions ==="
+          ls -la $GITHUB_WORKSPACE/pte_driver_mod/.tmp_versions 2>&1 | head -10
+          echo "=== DIAG M 下 .mod.c/.mod.o ==="
+          ls -la $GITHUB_WORKSPACE/pte_driver_mod/*.mod.c $GITHUB_WORKSPACE/pte_driver_mod/*.mod.o $GITHUB_WORKSPACE/pte_driver_mod/*.mod 2>&1
           echo "=== out/scripts/module.lds ==="
           ls -la $GITHUB_WORKSPACE/kernel_workspace/common/out/scripts/module.lds 2>&1
           cp -f $GITHUB_WORKSPACE/pte_driver_mod/pte_driver.ko $GITHUB_WORKSPACE/ 2>/dev/null || true
