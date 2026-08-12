@@ -143,9 +143,11 @@ jobs:
           find $OUT/pte_driver_mod -name '*.ko' -exec ls -la {} \; 2>&1
           echo "===== .mod.c/.mod.o 位置 ====="
           find $OUT/pte_driver_mod -name '*.mod*' 2>&1 | head
-          # 复制产物到工作区根（供 artifact 匹配）
-          find $OUT/pte_driver_mod -name 'pte_driver.ko' -exec cp -f {} $GITHUB_WORKSPACE/ \; 2>/dev/null || true
-          ls -la $GITHUB_WORKSPACE/pte_driver.ko 2>&1 || true
+          # 复制产物到工作区根下的 artifacts 子目录（供 upload-artifact 可靠匹配）
+          mkdir -p $GITHUB_WORKSPACE/artifacts
+          find $OUT/pte_driver_mod -name 'pte_driver.ko' -exec cp -f {} $GITHUB_WORKSPACE/artifacts/ \; 2>/dev/null || true
+          ls -la $GITHUB_WORKSPACE/artifacts/ 2>&1 || true
+          echo "#### 最终 .ko 绝对路径: $GITHUB_WORKSPACE/artifacts/pte_driver.ko ####"
           exit $MAKE_RC
 
       # 7. 上传 pte_driver.ko
@@ -154,4 +156,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pte_driver_ko
-          path: $GITHUB_WORKSPACE/pte_driver*.ko
+          path: artifacts/
+          if-no-files-found: warn
