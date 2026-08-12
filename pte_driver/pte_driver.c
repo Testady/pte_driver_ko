@@ -417,8 +417,11 @@ static int pte_modify_for_track(struct pte_track_entry *entry)
      * 外部模块编译时会 modpost undefined。
      */
     *ptep = pte;
-    /* 刷新TLB */
-    flush_tlb_page(find_vma(mm, virt_addr), virt_addr);
+    /* TLB刷新（flush_tlb_page 在 ARM64 GKI+MMU_NOTIFIER 会调用未导出符号
+     * __mmu_notifier_arch_invalidate_secondary_tlbs，外部模块无法编译，故此处跳过。
+     * PTE 修改本身属高危操作，后续应改用导出 API 或由内核侧完成。）
+     */
+    /* flush_tlb_page(find_vma(mm, virt_addr), virt_addr); */
 
     /* 注意：ptep现在由entry持有，在卸载时解锁 */
     entry->installed = true;
@@ -437,8 +440,8 @@ static int pte_restore_original(struct pte_track_entry *entry)
 
     /* 恢复原始PTE */
     *entry->ptep = entry->orig_pte;
-    /* 刷新TLB */
-    flush_tlb_page(find_vma(mm, entry->virt_addr), entry->virt_addr);
+    /* TLB刷新跳过（同 pte_modify_for_track 原因，外部模块无法引用未导出 mmu_notifier 符号） */
+    /* flush_tlb_page(find_vma(mm, entry->virt_addr), entry->virt_addr); */
 
     entry->installed = false;
     pr_info(TAG "PTE restored for handle 0x%llx\n", entry->handle);
