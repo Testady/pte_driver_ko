@@ -8,7 +8,7 @@ env:
   KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
   # 缓存 key：缓存命中即完全复用（跳过下载+编译内核），只重编 pte_driver.ko。
   # 若需强制重编（例如改驱动代码想重新编译内核），改这个值或手动清 cache 再跑。
-  CCACHE_KEY: ccache-neov4-6.6.118
+  CCACHE_KEY: ccache-device-config-v1
 
 on:
   workflow_dispatch:
@@ -73,8 +73,8 @@ jobs:
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
           done
 
-      # 3. 配置 gki_defconfig（缓存命中时自动跳过）
-      - name: gki_defconfig 配置
+      # 3. 配置内核（缓存命中时自动跳过）—— 使用设备真实 config（含正确 LOCALVERSION 与 MODULE_SIG_ALL/SHA1，确保 .ko 的 module_layout 等符号 CRC 精确匹配设备内核）
+      - name: 配置内核（设备真实 config）
         if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
           WORKDIR="$(pwd)"
@@ -82,10 +82,13 @@ jobs:
           export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
           export PATH="$WORKDIR/kernel_workspace/build-tools/build-tools/bin:$PATH"
           cd kernel_workspace/common
-          # 设置与设备一致的 LOCALVERSION（确保 .ko vermagic 精确匹配设备内核）
-          echo "CONFIG_LOCALVERSION=\"-android15-8-g29d86c5fc9dd-abogki428889875-4k\"" >> ./arch/arm64/configs/gki_defconfig
-          echo "CONFIG_LOCALVERSION_AUTO=n" >> ./arch/arm64/configs/gki_defconfig
-          make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
+          # 直接用设备真实 .config 作为编译配置源（保证所有符号 CRC 与设备内核一致）
+          mkdir -p out
+          cp -f $GITHUB_WORKSPACE/device_config.txt out/.config
+          # olddefconfig：将过时/缺失项按 kconfig 默认补齐并归一化到正确格式
+          make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
+          echo "=== 确认关键配置项 ==="
+          grep -E 'CONFIG_LOCALVERSION=|CONFIG_MODULE_SIG_ALL|CONFIG_MODULE_SIG_SHA1|CONFIG_MODULE_SIG_HASH|CONFIG_MODULE_SIG=|CONFIG_MODULES=' out/.config
 
       # 4. 编译完整 GKI 内核（缓存命中时自动跳过；生成 out/Module.symvers 确保 .ko 符号匹配）
       - name: 编译内核
