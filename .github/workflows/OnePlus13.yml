@@ -47,24 +47,45 @@ jobs:
           mkdir kernel_workspace
           cd kernel_workspace
 
+          # 带自动重试的下载函数：aria2c 内部重连 + 外层循环重试，抵抗 GitHub 503/EOF 抖动
+          dl() {
+            local url="$1" out="$2" tries="${3:-12}" i o
+            for ((i=1;i<=tries;i++)); do
+              echo ">> 下载尝试 $i/$tries : $out"
+              if aria2c --max-tries=0 --retry-wait=6 --connect-timeout=30 --timeout=120 -s16 -x16 -k1M "$url" -o "$out"; then
+                [ -f "$out" ] && [ -s "$out" ] && echo ">> 下载成功: $out" && return 0
+              fi
+              echo ">> $out 下载失败(可能503/EOF), 5秒后重试..."
+              rm -f "$out"
+              sleep 5
+            done
+            echo ">> ★ 多次重试后仍失败: $out" >&2
+            return 1
+          }
+
           echo "正在克隆源码仓库..."
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_b_16.0.0_oneplus_13_6.6.118.zip -o common.zip &&
-          unzip -q common.zip &&
-          mv "android_kernel_common_oneplus_sm8750-oneplus-sm8750_b_16.0.0_oneplus_13_6.6.118" common &&
-          rm -rf common.zip &
+          dl "https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_b_16.0.0_oneplus_13_6.6.118.zip" common.zip &
+          PID1=$!
 
-          echo "正在克隆llvm-clang18工具链..." &&
-          mkdir -p clang18 &&
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip -o clang.zip &&
-          unzip -q clang.zip -d clang18 &&
-          rm -rf clang.zip &
+          echo "正在克隆llvm-clang18工具链..."
+          mkdir -p clang18
+          dl "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip" clang.zip &
+          PID2=$!
 
-          echo "正在克隆构建工具..." &&
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip -o build-tools.zip &&
-          unzip -q build-tools.zip &&
-          rm -rf build-tools.zip &
+          echo "正在克隆构建工具..."
+          dl "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip" build-tools.zip &
+          PID3=$!
 
-          wait
+          # 等所有下载完成；任何一个失败则整体失败
+          wait $PID1 $PID2 $PID3
+          echo ">> 三个包下载全部完成，开始解压"
+          unzip -q common.zip
+          mv "android_kernel_common_oneplus_sm8750-oneplus-sm8750_b_16.0.0_oneplus_13_6.6.118" common
+          rm -rf common.zip
+          unzip -q clang.zip -d clang18
+          rm -rf clang.zip
+          unzip -q build-tools.zip
+          rm -rf build-tools.zip
           echo "所有源码及工具链初始化完成！"
           # 去除 ABI 保护 & 去除 dirty 后缀
           rm common/android/abi_gki_protected_exports_* || true
