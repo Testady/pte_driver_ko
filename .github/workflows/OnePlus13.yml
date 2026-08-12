@@ -95,10 +95,12 @@ jobs:
           cd kernel_workspace/common
           # 编译内核镜像
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
-          # 生成 out/Module.symvers（编译外部模块必需，否则 modpost 全报 undefined 符号）
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error modules_prepare
+          # 内核构建实际把导出符号写进了 vmlinux.symvers，
+          # 编译外部模块（M=...）时 modpost 读的是 out/Module.symvers，
+          # 故将 vmlinux.symvers 复制为 Module.symvers（含全部内核导出符号+CRC，CFI 环境必需）。
+          cp -f out/vmlinux.symvers out/Module.symvers
           echo "=== 确认 Module.symvers 已生成 ==="
-          ls -la out/Module.symvers 2>&1
+          ls -la out/vmlinux.symvers out/Module.symvers 2>&1
 
       # 5. 保存缓存（仅在本次真正编译过硬核后保存/更新）
       - name: 保存缓存
