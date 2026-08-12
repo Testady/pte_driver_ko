@@ -29,9 +29,9 @@ jobs:
           mkdir kernel_workspace
           cd kernel_workspace
 
-          # 安装 ccache（CC="ccache clang" 编译必需）
+          # 安装编译依赖（gki_defconfig/内核编译必需）
           sudo apt update >/dev/null 2>&1
-          sudo apt-get install -y --no-install-recommends ccache >/dev/null 2>&1 || true
+          sudo apt-get install -y --no-install-recommends ccache libelf-dev libssl-dev binutils python-is-python3 >/dev/null 2>&1 || true
 
           echo "正在克隆源码仓库..."
           aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_b_16.0.0_oneplus_13_6.6.118.zip -o common.zip &&
