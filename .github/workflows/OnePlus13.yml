@@ -128,6 +128,10 @@ jobs:
           cp -f out/vmlinux.symvers out/Module.symvers
           echo "=== 确认 Module.symvers 已生成 ==="
           ls -la out/vmlinux.symvers out/Module.symvers 2>&1
+          echo "=== DIAG: Module.symvers 中 module_layout 与其他关键符号 CRC ==="
+          grep -E 'module_layout|__this_module|MODULE_SIG|misc_register' out/Module.symvers 2>&1 | head -20
+          echo "=== DIAG: Module.symvers module_layout 行 ==="
+          grep -F 'module_layout' out/Module.symvers 2>&1
 
       # 5. 保存缓存（仅在本次真正编译过硬核后保存/更新）
       - name: 保存缓存
@@ -172,6 +176,49 @@ jobs:
           find $OUT/pte_driver_mod -name 'pte_driver.ko' -exec cp -f {} $GITHUB_WORKSPACE/artifacts/ \; 2>/dev/null || true
           ls -la $GITHUB_WORKSPACE/artifacts/ 2>&1 || true
           echo "#### 最终 .ko 绝对路径: $GITHUB_WORKSPACE/artifacts/pte_driver.ko ####"
+          echo "===== DIAG: .ko 里 module_layout CRC (对比 Module.symvers) 是否一致 ====="
+          python3 - <<'PYEOF'
+import struct
+def read_versions(path):
+    data=open(path,'rb').read()
+    if not data.startswith(b'\x7fELF'): return {}
+    shoff=struct.unpack_from('<Q',data,0x28)[0]
+    shentsize=struct.unpack_from('<H',data,0x3a)[0]
+    shnum=struct.unpack_from('<H',data,0x3c)[0]
+    shstrndx=struct.unpack_from('<H',data,0x3e)[0]
+    shstr_off=struct.unpack_from('<Q',data,shoff+shstrndx*shentsize+0x18)[0]
+    shstr_size=struct.unpack_from('<Q',data,shoff+shstrndx*shentsize+0x20)[0]
+    shstr=data[shstr_off:shstr_off+shstr_size]
+    versions=None
+    for i in range(shnum):
+        e=shoff+i*shentsize
+        no=struct.unpack_from('<I',data,e)[0]
+        nm=shstr[no:shstr.find(b'\0',no)].decode()
+        off=struct.unpack_from('<Q',data,e+0x18)[0]
+        size=struct.unpack_from('<Q',data,e+0x20)[0]
+        if nm=='__versions':
+            versions=data[off:off+size]; break
+    out={}
+    if versions:
+        for i in range(0,len(versions),64):
+            crc=struct.unpack_from('<Q',versions,i)[0]
+            name=versions[i+8:i+64].split(b'\0')[0].decode()
+            out[name]=hex(crc)
+    return out
+ko='/home/runner/work/pte_driver_ko/pte_driver_ko/artifacts/pte_driver.ko'
+v=read_versions(ko)
+print('.ko module_layout CRC =', v.get('module_layout'))
+print('.ko misc_register CRC  =', v.get('misc_register'))
+import os
+sym='/home/runner/work/pte_driver_ko/pte_driver_ko/kernel_workspace/common/out/Module.symvers'
+if os.path.exists(sym):
+    sl=(open(sym).read()+'\n').split('\n')
+    for l in sl:
+        if 'module_layout' in l or 'misc_register' in l:
+            print('Module.symvers:', l[:120])
+else:
+    print('Module.symvers NOT FOUND at', sym)
+PYEOF
           exit $MAKE_RC
 
       # 7. 上传 pte_driver.ko
