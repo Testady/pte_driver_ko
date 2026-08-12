@@ -6,6 +6,8 @@ env:
   KERNEL_VERSION: '6.6'
   SUB_VERSION: '118'
   KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
+  # 缓存 key：缓存命中即完全复用（跳过下载+编译内核），只重编 pte_driver.ko。
+  # 若需强制重编（例如改驱动代码想重新编译内核），改这个值或手动清 cache 再跑。
   CCACHE_KEY: ccache-neov4-6.6.118
 
 on:
@@ -22,8 +24,17 @@ jobs:
       - name: Checkout 仓库
         uses: actions/checkout@v4
 
-      # 1. 下载 GKI common 源码 + clang18 + build-tools（与设备内核 6.6.118 完全一致的环境）
+      # 1. 恢复缓存（包含已编译的 kernel_workspace/out + clang18 + build-tools）
+      - name: 恢复缓存
+        id: restore-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: kernel_workspace
+          key: pte-cache-${{ env.CCACHE_KEY }}
+
+      # 2. 下载 GKI common 源码 + clang18 + build-tools（缓存命中时自动跳过）
       - name: 初始化并下载内核源码及工具链
+        if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
           rm -rf kernel_workspace
           mkdir kernel_workspace
@@ -59,8 +70,9 @@ jobs:
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
           done
 
-      # 2. 配置 gki_defconfig（生成与设备 GKI 内核完全匹配的构建环境）
+      # 3. 配置 gki_defconfig（缓存命中时自动跳过）
       - name: gki_defconfig 配置
+        if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
@@ -72,8 +84,9 @@ jobs:
           echo "CONFIG_LOCALVERSION_AUTO=n" >> ./arch/arm64/configs/gki_defconfig
           make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
 
-      # 3. 编译完整 GKI 内核（生成完整 Module.symvers，确保 .ko 符号版本与设备一致）
+      # 4. 编译完整 GKI 内核（缓存命中时自动跳过；生成 out/Module.symvers 确保 .ko 符号匹配）
       - name: 编译内核
+        if: steps.restore-cache.outputs.cache-hit != 'true'
         run: |
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
@@ -87,7 +100,15 @@ jobs:
           echo "=== 确认 Module.symvers 已生成 ==="
           ls -la out/Module.symvers 2>&1
 
-      # 4. 编译 pte_driver 独立模块 (.ko)
+      # 5. 保存缓存（仅在本次真正编译过硬核后保存/更新）
+      - name: 保存缓存
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: kernel_workspace
+          key: pte-cache-${{ env.CCACHE_KEY }}
+
+      # 6. 编译 pte_driver 独立模块 (.ko) —— 每次都会执行
       - name: 编译 pte_driver 独立模块 (.ko)
         run: |
           cd kernel_workspace/common
@@ -103,7 +124,7 @@ jobs:
           ls -la ./pte_driver_mod/*.ko 2>&1
           cp -f ./pte_driver_mod/pte_driver.ko $GITHUB_WORKSPACE/ 2>/dev/null || true
 
-      # 5. 上传 pte_driver.ko
+      # 7. 上传 pte_driver.ko
       - name: 上传 pte_driver.ko
         if: always()
         uses: actions/upload-artifact@v7
