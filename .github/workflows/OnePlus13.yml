@@ -122,6 +122,8 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/build-tools/build-tools/bin:$PATH"
           export PATH="/usr/lib/ccache:$PATH"
           # 复制 pte_driver 源码到内核树内（仓库默认 checkout 在 $GITHUB_WORKSPACE）
+          # 先清除可能随缓存恢复的旧编译残留（.o/.mod），避免链接规则混乱导致 No rule to make target
+          rm -rf ./pte_driver_mod
           cp -r $GITHUB_WORKSPACE/pte_driver ./pte_driver_mod
           echo "=== 编译 pte_driver.ko ==="
           make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$(pwd)/pte_driver_mod modules 2>&1 | tail -30
