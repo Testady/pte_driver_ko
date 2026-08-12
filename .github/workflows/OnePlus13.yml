@@ -122,41 +122,30 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang18/bin:$PATH"
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/build-tools/build-tools/bin:$PATH"
           export PATH="/usr/lib/ccache:$PATH"
-          # 模块源码放内核树外：$GITHUB_WORKSPACE/pte_driver_mod（绝对路径）
-          rm -rf $GITHUB_WORKSPACE/pte_driver_mod
-          cp -r $GITHUB_WORKSPACE/pte_driver $GITHUB_WORKSPACE/pte_driver_mod
-          cd $GITHUB_WORKSPACE/kernel_workspace/common
-          # 关键：module.lds 由 modules_prepare 目标生成，而缓存=make Image 产物不含它。
-          # 外部模块 modfinal 的 "%.ko" 链接规则依赖 scripts/module.lds，缺失则报
-          # "No rule to make target X.ko"。故编译模块前先按需生成它。
-          echo "=== [1] 预生成 out/scripts/module.lds ==="
-          make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out scripts/module.lds 2>&1 | tail -15
-          ls -la out/scripts/module.lds 2>&1
-          # 再生成 prepare 所必需的内核生成头（防缺 generated header）
-          make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out modules_prepare 2>&1 | tail -15
-          echo "=== 编译 pte_driver.ko（捕获退出码继续诊断）==="
-          set +e
-          make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$GITHUB_WORKSPACE/pte_driver_mod modules > /tmp/mod_build.log 2>&1
+          COMMON=$GITHUB_WORKSPACE/kernel_workspace/common
+          OUT=$COMMON/out
+          # 预生成 out/scripts/module.lds（缓存=make Image 产物不含它，缺失会让 %.ko 链接规则失配）
+          make -C $COMMON LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out scripts/module.lds 2>&1 | tail -5
+          ls -la $OUT/scripts/module.lds 2>&1 || echo "module.lds 仍缺失"
+          # 关键：把模块源码放进 out(objtree) 树内部，使 $(obj) 与 M 绝对路径在 O= 分离构建下一致，
+          #       从而 MODPOST 生成的 .mod.c 与 modfinal 链接所在的 $(obj) 不错位，%.ko 规则才能命中。
+          rm -rf $OUT/pte_driver_mod
+          cp -r $GITHUB_WORKSPACE/pte_driver $OUT/pte_driver_mod
+          rm -f $OUT/pte_driver_mod/*.o $OUT/pte_driver_mod/*.ko $OUT/pte_driver_mod/*.mod* $OUT/pte_driver_mod/.*.cmd 2>/dev/null || true
+          echo "M 模块目录(在 out 内): $OUT/pte_driver_mod"
+          echo "=== 编译 pte_driver.ko ==="
+          make -C $COMMON LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$OUT/pte_driver_mod modules > /tmp/mod_build.log 2>&1
           MAKE_RC=$?
-          set -e
           echo "#### make return code = $MAKE_RC ####"
-          echo "===== 完整 make 输出（全文）====="
-          cat /tmp/mod_build.log
-          echo "===== MAKE OUTPUT END ====="
-          echo "===== DIAG M目录文件 ====="
-          ls -la $GITHUB_WORKSPACE/pte_driver_mod/ 2>&1
-          echo "===== DIAG M 下 .ko/.mod/.mod.c/modules.order/Module.symvers ====="
-          find $GITHUB_WORKSPACE/pte_driver_mod \( -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' -o -name 'modules.order' -o -name 'Module.symvers' \) 2>&1
-          echo "===== DIAG out 下 pte_driver_mod/.mod.c/.mod.o ====="
-          find $GITHUB_WORKSPACE/kernel_workspace/common/out \( -name 'pte_driver*' -o -name '*.mod.c' -o -name '*.mod.o' \) 2>/dev/null | head -20
-          echo "===== DIAG out/modules.order(仅头部) ====="
-          head -20 $GITHUB_WORKSPACE/kernel_workspace/common/out/modules.order 2>&1
-          echo "===== DIAG M/modules.order(仅头部) ====="
-          head -20 $GITHUB_WORKSPACE/pte_driver_mod/modules.order 2>&1
-          echo "===== DIAG 找到 .ko 则复制 ====="
-          find $GITHUB_WORKSPACE -name 'pte_driver.ko' -exec cp -f {} $GITHUB_WORKSPACE/ \; 2>/dev/null || true
-          ls -la $GITHUB_WORKSPACE/pte_driver.ko 2>&1
-          # 让真实 make 退出码生效（避免假成功）
+          echo "===== make 输出(尾部200) ====="
+          tail -200 /tmp/mod_build.log
+          echo "===== 查找 .ko ====="
+          find $OUT/pte_driver_mod -name '*.ko' -exec ls -la {} \; 2>&1
+          echo "===== .mod.c/.mod.o 位置 ====="
+          find $OUT/pte_driver_mod -name '*.mod*' 2>&1 | head
+          # 复制产物到工作区根（供 artifact 匹配）
+          find $OUT/pte_driver_mod -name 'pte_driver.ko' -exec cp -f {} $GITHUB_WORKSPACE/ \; 2>/dev/null || true
+          ls -la $GITHUB_WORKSPACE/pte_driver.ko 2>&1 || true
           exit $MAKE_RC
 
       # 7. 上传 pte_driver.ko
