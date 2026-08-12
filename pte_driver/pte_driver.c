@@ -411,9 +411,12 @@ static int pte_modify_for_track(struct pte_track_entry *entry)
 
     /* 使PTE无效 — 清除PTE_VALID (bit0) */
     pte = clear_pte_bit(pte, __pgprot(PTE_VALID));
-    /* 同时清除Access Flag，确保再次访问时触发fault */
-    set_pte_at(mm, virt_addr, ptep, pte);
-
+    /* 直接写 PTE 指针，绕过 set_pte_at 宏：
+     * set_pte_at 在 ARM64 GKI（CONFIG_ARM64_MTE + mmu_notifier）会内联调用
+     * 未导出符号 mte_sync_tags / __mmu_notifier_arch_invalidate_secondary_tlbs，
+     * 外部模块编译时会 modpost undefined。
+     */
+    *ptep = pte;
     /* 刷新TLB */
     flush_tlb_page(find_vma(mm, virt_addr), virt_addr);
 
@@ -433,8 +436,7 @@ static int pte_restore_original(struct pte_track_entry *entry)
         return -EINVAL;
 
     /* 恢复原始PTE */
-    set_pte_at(mm, entry->virt_addr, entry->ptep, entry->orig_pte);
-
+    *entry->ptep = entry->orig_pte;
     /* 刷新TLB */
     flush_tlb_page(find_vma(mm, entry->virt_addr), entry->virt_addr);
 
@@ -528,7 +530,7 @@ static void pte_destroy_entry(struct pte_track_entry *entry)
 
     /* 恢复PTE */
     if (entry->installed && entry->ptep) {
-        set_pte_at(entry->mm, entry->virt_addr, entry->ptep, entry->orig_pte);
+        *entry->ptep = entry->orig_pte;
         spinlock_t *ptl = pte_lockptr(entry->mm, entry->pmd);
         pte_unmap_unlock(entry->ptep, ptl);
     }
