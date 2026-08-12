@@ -113,14 +113,7 @@ jobs:
           path: kernel_workspace
           key: pte-cache-${{ env.CCACHE_KEY }}
 
-      # 6. 安装系统级编译依赖（ccache 等，不在缓存里，每次都要装）
-      #    必须在编译 .ko 之前、且不随缓存跳过而跳过。
-      - name: 安装系统编译依赖
-        run: |
-          sudo apt update >/dev/null 2>&1
-          sudo apt-get install -y --no-install-recommends ccache libelf-dev libssl-dev binutils python-is-python3 >/dev/null 2>&1 || true
-
-      # 7. 编译 pte_driver 独立模块 (.ko) —— 每次都会执行
+      # 6. 编译 pte_driver 独立模块 (.ko) —— 每次都会执行
       - name: 编译 pte_driver 独立模块 (.ko)
         run: |
           cd kernel_workspace/common
