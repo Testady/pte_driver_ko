@@ -140,21 +140,22 @@ jobs:
           MAKE_RC=$?
           set -e
           echo "#### make return code = $MAKE_RC ####"
-          echo "===== 完整 make 输出（最后 120 行）====="
-          tail -120 /tmp/mod_build.log
+          echo "===== 完整 make 输出（全文）====="
+          cat /tmp/mod_build.log
+          echo "===== MAKE OUTPUT END ====="
           echo "===== DIAG M目录文件 ====="
           ls -la $GITHUB_WORKSPACE/pte_driver_mod/ 2>&1
           echo "===== DIAG M 下 .ko/.mod/.mod.c/modules.order/Module.symvers ====="
           find $GITHUB_WORKSPACE/pte_driver_mod \( -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' -o -name 'modules.order' -o -name 'Module.symvers' \) 2>&1
-          echo "===== DIAG out/scripts/module.lds ====="
-          ls -la out/scripts/module.lds 2>&1
+          echo "===== DIAG out 下 pte_driver_mod/.mod.c/.mod.o ====="
+          find $GITHUB_WORKSPACE/kernel_workspace/common/out \( -name 'pte_driver*' -o -name '*.mod.c' -o -name '*.mod.o' \) 2>/dev/null | head -20
           echo "===== DIAG out/modules.order(仅头部) ====="
-          head -20 out/modules.order 2>&1
+          head -20 $GITHUB_WORKSPACE/kernel_workspace/common/out/modules.order 2>&1
           echo "===== DIAG M/modules.order(仅头部) ====="
           head -20 $GITHUB_WORKSPACE/pte_driver_mod/modules.order 2>&1
-          echo "===== 产物复制 ====="
-          cp -f $GITHUB_WORKSPACE/pte_driver_mod/pte_driver.ko $GITHUB_WORKSPACE/ 2>/dev/null || true
-          cp -f $GITHUB_WORKSPACE/pte_driver_mod/Module.symvers $GITHUB_WORKSPACE/ 2>/dev/null || true
+          echo "===== DIAG 找到 .ko 则复制 ====="
+          find $GITHUB_WORKSPACE -name 'pte_driver.ko' -exec cp -f {} $GITHUB_WORKSPACE/ \; 2>/dev/null || true
+          ls -la $GITHUB_WORKSPACE/pte_driver.ko 2>&1
           # 让真实 make 退出码生效（避免假成功）
           exit $MAKE_RC
 
