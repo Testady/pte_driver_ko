@@ -385,8 +385,8 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/clang18/bin:$PATH"
           export PATH="$GITHUB_WORKSPACE/kernel_workspace/build-tools/build-tools/bin:$PATH"
           export PATH="/usr/lib/ccache:$PATH"
-          # 复制 pte_driver 源码到内核树内
-          cp -r $GITHUB_WORKSPACE/pte_driver ./pte_driver_mod
+          # 复制 pte_driver 源码到内核树内（仓库 clone 在 $GITHUB_ACTOR 目录）
+          cp -r $GITHUB_WORKSPACE/$GITHUB_ACTOR/pte_driver ./pte_driver_mod
           echo "=== 编译 pte_driver.ko ==="
           make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$(pwd)/pte_driver_mod modules 2>&1 | tail -30
           echo "=== 产物检查 ==="
