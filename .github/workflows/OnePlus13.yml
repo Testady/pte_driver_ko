@@ -162,7 +162,7 @@ jobs:
           rm -f $OUT/pte_driver_mod/*.o $OUT/pte_driver_mod/*.ko $OUT/pte_driver_mod/*.mod* $OUT/pte_driver_mod/.*.cmd 2>/dev/null || true
           echo "M 模块目录(在 out 内): $OUT/pte_driver_mod"
           echo "=== 编译 pte_driver.ko ==="
-          make -C $COMMON LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error KCFLAGS+="-fno-sanitize=cfi -fno-sanitize=cfi-icall -fno-sanitize=kcfi -fno-stack-protector -fno-sanitize=shadow-call-stack -fno-lto" O=out M=$OUT/pte_driver_mod modules > /tmp/mod_build.log 2>&1
+          make -C $COMMON LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld KCFLAGS+=-O2 KCFLAGS+=-Wno-error O=out M=$OUT/pte_driver_mod modules > /tmp/mod_build.log 2>&1
           MAKE_RC=$?
           echo "#### make return code = $MAKE_RC ####"
           echo "===== make 输出(尾部200) ====="
