@@ -102,9 +102,10 @@ static void rand_dev_name(void)
 #define MAX_TRACK_ENTRIES       64
 #define MAX_REG_MODIFY          10
 
-/* ==================== 与用户层共享的数据结构 (PACKED) ==================== */
-#pragma pack(push, 1)
-
+/* ==================== 与用户层共享的数据结构 ====================
+ * 对齐说明：COPY_MEMORY/MODULE_BASE/DRIVER_CHECK/PERF_REQUEST 采用标准
+ * (非PACKED) aarch64 对齐，与用户态 辅助类.h 对应结构一致；
+ * PTE 相关结构(应用端在 #pragma pack(push,1) 区块)才使用 PACKED。 */
 struct copy_memory {
     pid_t pid;
     uintptr_t addr;
@@ -132,6 +133,7 @@ struct perf_request {
     uint64_t src_buf;
 };
 
+#pragma pack(push, 1)
 struct reg_modify_config {
     int reg_index;
     uint8_t reg_type;
