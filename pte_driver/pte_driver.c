@@ -1136,16 +1136,15 @@ static int resolve_kallsyms(void)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
     /* 6.6: kallsyms_lookup_name 未导出，用 kprobe 按名解析 */
-    memset(&kp, 0, sizeof(kp));
-    kp.symbol_name = "fpsimd_save_state";
-    ret = register_kprobe(&kp);
-    if (ret == 0) {
-        fpsimd_save_state_ptr = (void *)kp.addr;
-        unregister_kprobe(&kp);
-        pr_info(TAG "fpsimd_save_state @ %px\n", kp.addr);
-    } else {
-        pr_warn(TAG "fpsimd_save_state not resolved (ret=%d)\n", ret);
-    }
+    /*
+     * CFI严格模式下 register_kprobe() 触发 KCFI 校验失败 → panic 重启。
+     * 此 kprobe 仅解析 fpsimd_save_state_ptr，而该指针并未被实际使用，
+     * 故整体注释掉以隔离崩溃点（KCFI Fatal 元凶）。
+     * fpsimd_save_state_ptr 保留声明但不再赋值，不影响其他逻辑。
+     */
+    (void)kp; (void)ret;
+    fpsimd_save_state_ptr = NULL;
+    pr_info(TAG "resolve_kallsyms: kprobe disabled (CFI-strict safe), fpsimd ptr NULL\n");
 #else
     /* 老内核直接可用 */
     kallsyms_lookup_name_ptr = (void *)kallsyms_lookup_name;
