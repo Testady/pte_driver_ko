@@ -433,8 +433,6 @@ static int pte_modify_for_track(struct pte_track_entry *entry)
  */
 static int pte_restore_original(struct pte_track_entry *entry)
 {
-    struct mm_struct *mm = entry->mm;
-
     if (!entry->installed || !entry->ptep)
         return -EINVAL;
 
