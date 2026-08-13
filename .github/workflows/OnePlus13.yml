@@ -7,8 +7,8 @@ env:
   SUB_VERSION: '118'
   KERNEL_NAME: 'android15-8-g29d86c5fc9dd-abogki428889875-4k'
   # 缓存 key：缓存命中即完全复用（跳过下载+编译内核），只重编 pte_driver.ko。
-  # 若需强制重编（例如改驱动代码想重新编译内核），改这个值或手动清 cache 再跑。
-  CCACHE_KEY: ccache-device-config-v1
+  # v2: 强制缓存失效, 在已装dwarves(pahole)的环境下完整重编内核, 生成 vmlinux 的 .BTF, 使模块带 .BTF 段(对齐paradise)
+  CCACHE_KEY: ccache-device-config-v2
 
 on:
   workflow_dispatch:
