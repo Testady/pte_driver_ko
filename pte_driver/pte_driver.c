@@ -47,9 +47,42 @@
 #include <asm/fpsimd.h>
 #include <asm/insn.h>
 
+#include <linux/random.h>
+
+#ifndef __nocfi
+#define __nocfi __attribute__((no_sanitize("cfi")))
+#endif
+
 #define DRIVER_NAME     "niuto"
-#define DEVICE_NAME     "niuto01"
-#define TAG             "[PTE-Driver]"
+/* 节点名在运行时随机化（modname 伪随机，避免固定 /dev/niuto01 特征） */
+#define DEVICE_NAME     DEV_NAME_RANDOM
+#define DEV_NAME_PREFIX "nv"   /* nondescript prefix（伪装成常见驱动缩写） */
+#define DEV_NAME_LEN    8
+#define TAG             "[nv]"
+/* 运行时随机节点名 buffer */
+static char dev_node_name[DEV_NAME_LEN + 1];
+static bool dev_name_ready = false;
+
+/*
+ * 生成随机节点名：前缀 + 随机 hex（每次 insmod 不同，避免固定特征被扫到）
+ */
+static void rand_dev_name(void)
+{
+    static const char hex[] = "0123456789abcdef";
+    u8 rnd[4];
+    int i;
+
+    dev_node_name[0] = '\0';
+    get_random_bytes(rnd, sizeof(rnd));
+    for (i = 0; i < sizeof(rnd); i++) {
+        dev_node_name[i * 2]     = hex[rnd[i] & 0xf];
+        dev_node_name[i * 2 + 1] = hex[(rnd[i] >> 4) & 0xf];
+    }
+    dev_node_name[DEV_NAME_LEN] = '\0';
+    dev_name_ready = true;
+}
+
+#define DEV_NAME_RANDOM dev_node_name
 
 /* ==================== ioctl 命令定义 ==================== */
 #define CMD_CHECK_DRIVER        0x400010
@@ -252,10 +285,11 @@ static int driver_read_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t 
     }
 
     map_addr = kmap_atomic(page);
+    if (size > PAGE_SIZE - offset) size = PAGE_SIZE - offset;
     memcpy(buf, map_addr + offset, size);
     kunmap_atomic(map_addr);
 
-    put_page(page);
+    unpin_user_page(page);
     mmput(mm);
     return 0;
 }
@@ -303,11 +337,12 @@ static int driver_write_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t
     }
 
     map_addr = kmap_atomic(page);
+    if (size > PAGE_SIZE - offset) size = PAGE_SIZE - offset;
     memcpy(map_addr + offset, buf, size);
     kunmap_atomic(map_addr);
 
     set_page_dirty_lock(page);
-    put_page(page);
+    unpin_user_page(page);
     mmput(mm);
     return 0;
 }
@@ -406,7 +441,7 @@ static int pte_modify_for_track(struct pte_track_entry *entry)
     entry->page_pa = pte_pfn(pte) << PAGE_SHIFT;
     entry->page_size = PAGE_SIZE;
 
-    pr_info(TAG "PTE at 0x%llx: orig=0x%016llx, pa=0x%llx, size=%u\n",
+    pr_debug(TAG "PTE at 0x%llx: orig=0x%016llx, pa=0x%llx, size=%u\n",
             virt_addr, pte_val(pte), entry->page_pa, entry->page_size);
 
     /* 使PTE无效 — 清除PTE_VALID (bit0) */
@@ -442,7 +477,7 @@ static int pte_restore_original(struct pte_track_entry *entry)
     /* flush_tlb_page(find_vma(mm, entry->virt_addr), entry->virt_addr); */
 
     entry->installed = false;
-    pr_info(TAG "PTE restored for handle 0x%llx\n", entry->handle);
+    pr_debug(TAG "PTE restored for handle 0x%llx\n", entry->handle);
     return 0;
 }
 
@@ -657,6 +692,7 @@ static int pte_apply_reg_modify(struct pte_track_entry *entry, struct pt_regs *r
  * do_page_fault pre_handler
  * 在缺页处理之前检查是否是我们追踪的地址
  */
+/* pre_handler: 让其自然携带与 kprobe_pre_handler_t 匹配的 KCFI typeid */
 static int pte_page_fault_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned long fault_addr;
@@ -848,7 +884,7 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         }
 
-        pr_info(TAG "Installed PTE track: handle=0x%llx, pid=%d, va=0x%llx\n",
+        pr_debug(TAG "Installed PTE track: handle=0x%llx, pid=%d, va=0x%llx\n",
                 entry->handle, req.pid, req.virt_addr);
         ret = 1;
         break;
@@ -872,7 +908,7 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         spin_unlock_irqrestore(&track_list_lock, irq_flags);
 
         pte_destroy_entry(entry);
-        pr_info(TAG "Uninstalled PTE track: handle=0x%llx\n", req.handle);
+        pr_debug(TAG "Uninstalled PTE track: handle=0x%llx\n", req.handle);
         ret = 1;
         break;
     }
@@ -937,7 +973,7 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (ret < 0)
             return ret;
 
-        pr_info(TAG "Resumed PTE track: handle=0x%llx\n", req.handle);
+        pr_debug(TAG "Resumed PTE track: handle=0x%llx\n", req.handle);
         ret = 1;
         break;
     }
@@ -989,7 +1025,7 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         entry->reg_config_count = config_count;
         spin_unlock(&entry->lock);
 
-        pr_info(TAG "Set %u reg modify configs for handle 0x%llx\n",
+        pr_debug(TAG "Set %u reg modify configs for handle 0x%llx\n",
                 config_count, batch_hdr.handle);
         ret = 1;
         break;
@@ -1045,7 +1081,7 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         if (ret < 0)
             return ret;
 
-        pr_info(TAG "Suspended PTE track: handle=0x%llx\n", req.handle);
+        pr_debug(TAG "Suspended PTE track: handle=0x%llx\n", req.handle);
         ret = 1;
         break;
     }
@@ -1144,7 +1180,7 @@ static int resolve_kallsyms(void)
      */
     (void)kp; (void)ret;
     fpsimd_save_state_ptr = NULL;
-    pr_info(TAG "resolve_kallsyms: kprobe disabled (CFI-strict safe), fpsimd ptr NULL\n");
+    pr_debug(TAG "resolve_kallsyms: kprobe disabled (CFI-strict safe), fpsimd ptr NULL\n");
 #else
     /* 老内核直接可用 */
     kallsyms_lookup_name_ptr = (void *)kallsyms_lookup_name;
@@ -1172,7 +1208,7 @@ static int register_fault_probe(void)
     }
 
     kprobe_registered = true;
-    pr_info(TAG "kprobe registered on do_page_fault at %p\n",
+    pr_debug(TAG "kprobe registered on do_page_fault at %p\n",
             kp_do_page_fault.addr);
     return 0;
 }
@@ -1182,7 +1218,7 @@ static void unregister_fault_probe(void)
     if (kprobe_registered) {
         unregister_kprobe(&kp_do_page_fault);
         kprobe_registered = false;
-        pr_info(TAG "kprobe unregistered\n");
+        pr_debug(TAG "kprobe unregistered\n");
     }
 }
 
@@ -1231,35 +1267,33 @@ static int __init pte_driver_init(void)
     /* 初始化追踪链表 */
     INIT_LIST_HEAD(&track_list);
 
+    /* 生成随机节点名（每次 insmod 不同，避免固定设备节点特征） */
+    rand_dev_name();
+    pr_debug(TAG "node /dev/%s\n", DEVICE_NAME);
+
     /* 解析符号 */
     resolve_kallsyms();
 
-    /* 注册misc设备 */
+    /* 注册misc设备（.name 已指向随机名 buffer） */
     ret = misc_register(&misc_dev);
     if (ret) {
-        pr_err(TAG "Failed to register misc device: %d\n", ret);
+        pr_warn(TAG "misc register failed: %d\n", ret);
         return ret;
     }
     misc_dev_ptr = &misc_dev;
-    pr_info(TAG "Device /dev/%s registered\n", DEVICE_NAME);
-    /* 缺页拦截kprobe — 默认禁用（insmod 即崩，需分离调试）
-     * 开启方法：ioctl 开关或注释本行后重编。
-     * 当前先跳过 register_fault_probe()，让驱动只做 misc+ioctl+内存读写，
-     * 用此版验证驱动本身能加载、不崩。确认稳定后再单独开缺页拦截。
+    pr_debug(TAG "device node m=%d\n", misc_dev.minor);
+
+#ifdef PTE_ENABLE_FAULT_PROBE
     ret = register_fault_probe();
-    if (ret < 0) {
-        pr_warn(TAG "Fault interception not available, "
-                "PTE tracking will use polling mode only\n");
-        pr_warn(TAG "[debug] SKIPPED register_fault_probe -> NULL ptr cast\n");
-    }
-    */
-    pr_info(TAG "缺页拦截kprobe 已默认禁用（debug 安全版）\n");
+    if (ret < 0)
+        pr_warn(TAG "fault interception unavailable\n");
+#else
+    pr_debug(TAG "fault probe disabled\n");
+#endif
 
-
-    pr_info(TAG "PTE Tracking Driver initialized successfully!\n");
+    pr_debug(TAG "driver ready\n");
     return 0;
 }
-
 static void __exit pte_driver_exit(void)
 {
     struct pte_track_entry *entry, *tmp;
@@ -1269,7 +1303,7 @@ static void __exit pte_driver_exit(void)
 
     /* 清理所有追踪条目 */
     list_for_each_entry_safe(entry, tmp, &track_list, list) {
-        pr_info(TAG "Cleanup: removing handle 0x%llx\n", entry->handle);
+        pr_debug(TAG "Cleanup: removing handle 0x%llx\n", entry->handle);
         list_del(&entry->list);
         pte_destroy_entry(entry);
     }
