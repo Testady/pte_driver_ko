@@ -250,6 +250,7 @@ static void (*fpsimd_save_state_ptr)(struct user_fpsimd_state *state) = NULL;
 
 /* ==================== 前向声明 ==================== */
 static int pte_find_and_modify(struct pte_track_entry *entry);
+static int pte_modify_for_track(struct pte_track_entry *entry);
 static int pte_restore_original(struct pte_track_entry *entry);
 static int pte_apply_reg_modify(struct pte_track_entry *entry, struct pt_regs *regs);
 static void pte_save_regs_snapshot(struct pte_track_entry *entry, struct pt_regs *regs);
@@ -257,6 +258,41 @@ static struct pte_track_entry *pte_find_by_handle(uint64_t handle);
 static struct pte_track_entry *pte_find_by_addr(struct mm_struct *mm, uint64_t fault_addr);
 
 /* ==================== 内存读写实现 ==================== */
+/* ============ PTE 自踩陷阱保护（稳定性修复） ============
+ * 背景：本驱动会清除目标页 PTE_VALID 来触发追踪缺页。当上层在已安装
+ *       追踪的页上调用跨进程读/写（CMD_READ/CMD_WRITE）时，驱动自身
+ *       访问这些 PTE 被置为无效的页，会触发自我缺页/页表异常，导致
+ *       内核 Oops/panic（手机重启，pstore 可见 Process_mem + pte 非法）。
+ * 修复：读/写前临时恢复命中页的原始 PTE，完成 IO 后再装回陷阱。
+ */
+static int pte_suspend_for_io(struct mm_struct *mm, uintptr_t addr,
+                              struct pte_track_entry **restore_list, int max)
+{
+    struct pte_track_entry *entry;
+    uintptr_t page = addr & PAGE_MASK;
+    int n = 0;
+    list_for_each_entry(entry, &track_list, list) {
+        if (entry->mm == mm && entry->installed && !entry->suspended &&
+            entry->virt_addr == page) {
+            spin_lock(&entry->lock);
+            pte_restore_original(entry);  /* installed true->false，PTE 恢复 */
+            spin_unlock(&entry->lock);
+            if (n < max) restore_list[n++] = entry;
+        }
+    }
+    return n;
+}
+static void pte_resume_after_io(struct pte_track_entry **list, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        struct pte_track_entry *entry = list[i];
+        spin_lock(&entry->lock);
+        if (!entry->installed)
+            pte_modify_for_track(entry);   /* 重新安装陷阱 */
+        spin_unlock(&entry->lock);
+    }
+}
 static int driver_read_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t size)
 {
     struct task_struct *task;
@@ -264,8 +300,9 @@ static int driver_read_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t 
     struct page *page = NULL;
     void *map_addr = NULL;
     unsigned long offset;
+    struct pte_track_entry *trap_save[4];
+    int ntrap = 0;
     int ret = -1;
-
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
     if (!task) {
@@ -275,13 +312,12 @@ static int driver_read_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t 
     }
     get_task_struct(task);
     rcu_read_unlock();
-
     mm = get_task_mm(task);
     put_task_struct(task);
     if (!mm) return -ESRCH;
-
     offset = addr & ~PAGE_MASK;
-    /* 使用 get_user_pages_remote */
+    /* 若目标页正被本驱动 PTE 追踪，临时恢复原始 PTE，避免自踩陷阱 */
+    ntrap = pte_suspend_for_io(mm, addr, trap_save, 4);
     down_read(&mm->mmap_lock);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
     ret = pin_user_pages_remote(mm, addr & PAGE_MASK, 1,
@@ -294,21 +330,26 @@ static int driver_read_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t 
                                 FOLL_FORCE, &page, NULL, NULL);
 #endif
     up_read(&mm->mmap_lock);
-
-    if (ret <= 0) {
+    if (ret > 0 && page) {
+        map_addr = kmap_local_page(page);
+        if (map_addr) {
+            if (size > PAGE_SIZE - offset) size = PAGE_SIZE - offset;
+            memcpy(buf, map_addr + offset, size);
+            kunmap_local(map_addr);
+            unpin_user_page(page);
+        } else {
+            unpin_user_page(page);
+            ret = -EIO;
+        }
+    } else {
         pr_err(TAG "read: get_user_pages failed (ret=%d)\n", ret);
-        mmput(mm);
-        return -EFAULT;
+        ret = -EFAULT;
+        if (page) unpin_user_page(page);
     }
-
-    map_addr = kmap_atomic(page);
-    if (size > PAGE_SIZE - offset) size = PAGE_SIZE - offset;
-    memcpy(buf, map_addr + offset, size);
-    kunmap_atomic(map_addr);
-
-    unpin_user_page(page);
+    /* 恢复被临时暂停的追踪陷阱 */
+    pte_resume_after_io(trap_save, ntrap);
     mmput(mm);
-    return 0;
+    return ret;
 }
 
 static int driver_write_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t size)
@@ -318,22 +359,24 @@ static int driver_write_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t
     struct page *page = NULL;
     void *map_addr = NULL;
     unsigned long offset;
+    struct pte_track_entry *trap_save[4];
+    int ntrap = 0;
     int ret = -1;
-
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
     if (!task) {
         rcu_read_unlock();
+        pr_err(TAG "write: pid %d not found\n", pid);
         return -ESRCH;
     }
     get_task_struct(task);
     rcu_read_unlock();
-
     mm = get_task_mm(task);
     put_task_struct(task);
     if (!mm) return -ESRCH;
-
     offset = addr & ~PAGE_MASK;
+    /* 若目标页正被本驱动 PTE 追踪，临时恢复原始 PTE，避免自踩陷阱 */
+    ntrap = pte_suspend_for_io(mm, addr, trap_save, 4);
     down_read(&mm->mmap_lock);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
     ret = pin_user_pages_remote(mm, addr & PAGE_MASK, 1,
@@ -346,22 +389,27 @@ static int driver_write_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t
                                 FOLL_FORCE | FOLL_WRITE, &page, NULL, NULL);
 #endif
     up_read(&mm->mmap_lock);
-
-    if (ret <= 0) {
+    if (ret > 0 && page) {
+        map_addr = kmap_local_page(page);
+        if (map_addr) {
+            if (size > PAGE_SIZE - offset) size = PAGE_SIZE - offset;
+            memcpy(map_addr + offset, buf, size);
+            kunmap_local(map_addr);
+            set_page_dirty_lock(page);
+            unpin_user_page(page);
+        } else {
+            unpin_user_page(page);
+            ret = -EIO;
+        }
+    } else {
         pr_err(TAG "write: get_user_pages failed (ret=%d)\n", ret);
-        mmput(mm);
-        return -EFAULT;
+        ret = -EFAULT;
+        if (page) unpin_user_page(page);
     }
-
-    map_addr = kmap_atomic(page);
-    if (size > PAGE_SIZE - offset) size = PAGE_SIZE - offset;
-    memcpy(map_addr + offset, buf, size);
-    kunmap_atomic(map_addr);
-
-    set_page_dirty_lock(page);
-    unpin_user_page(page);
+    /* 恢复被临时暂停的追踪陷阱 */
+    pte_resume_after_io(trap_save, ntrap);
     mmput(mm);
-    return 0;
+    return ret;
 }
 
 /* ==================== PTE 遍历与修改 ==================== */
