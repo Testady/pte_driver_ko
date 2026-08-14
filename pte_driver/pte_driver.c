@@ -35,6 +35,7 @@
 #include <linux/ioctl.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/ktime.h>
 #include <linux/wait.h>
 #include <linux/kprobes.h>
 #include <linux/hugetlb.h>
@@ -249,11 +250,8 @@ static void *(*kallsyms_lookup_name_ptr)(const char *name) = NULL;
 static void (*fpsimd_save_state_ptr)(struct user_fpsimd_state *state) = NULL;
 
 /* ==================== 前向声明 ==================== */
-static int pte_find_and_modify(struct pte_track_entry *entry);
 static int pte_modify_for_track(struct pte_track_entry *entry);
 static int pte_restore_original(struct pte_track_entry *entry);
-static int pte_apply_reg_modify(struct pte_track_entry *entry, struct pt_regs *regs);
-static void pte_save_regs_snapshot(struct pte_track_entry *entry, struct pt_regs *regs);
 static struct pte_track_entry *pte_find_by_handle(uint64_t handle);
 static struct pte_track_entry *pte_find_by_addr(struct mm_struct *mm, uint64_t fault_addr);
 
@@ -374,9 +372,14 @@ static int driver_write_process_mem(pid_t pid, uintptr_t addr, void *buf, size_t
  * 在目标进程的页表中查找虚拟地址对应的PTE。
  * 返回PTE指针（已锁定）并填充entry中的相关字段。
  */
-static int pte_lookup_in_mm(struct mm_struct *mm, uint64_t virt_addr,
-                            pte_t **ptep_out, pgd_t **pgd_out,
-                            p4d_t **p4d_out, pud_t **pud_out, pmd_t **pmd_out)
+/*
+ * 在持有 mm->mmap_lock(read) 的前提下定位并锁定目标地址的PTE。
+ * 调用方负责持有 mm->mmap_lock 并在成功后配对 pte_unmap_unlock(ptep, ptl)。
+ * 返回0成功（*ptep_out 指向有效 present PTE，*ptl_out 为其页表锁）；
+ * 负值错误。绝不长期跨函数持有 ptl/kmap 映射，杜绝锁泄漏与页表UAF。
+ */
+static int pte_lock_pte(struct mm_struct *mm, uint64_t virt_addr,
+                        pte_t **ptep_out, spinlock_t **ptl_out)
 {
     pgd_t *pgd;
     p4d_t *p4d;
@@ -385,45 +388,34 @@ static int pte_lookup_in_mm(struct mm_struct *mm, uint64_t virt_addr,
     pte_t *ptep;
     spinlock_t *ptl;
 
+    *ptep_out = NULL;
+    *ptl_out = NULL;
+
     pgd = pgd_offset(mm, virt_addr);
     if (pgd_none(*pgd) || pgd_bad(*pgd))
         return -EINVAL;
-
     p4d = p4d_offset(pgd, virt_addr);
     if (p4d_none(*p4d) || p4d_bad(*p4d))
         return -EINVAL;
-
     pud = pud_offset(p4d, virt_addr);
     if (pud_none(*pud) || pud_bad(*pud))
         return -EINVAL;
-
     pmd = pmd_offset(pud, virt_addr);
     if (pmd_none(*pmd) || pmd_bad(*pmd))
         return -EINVAL;
-
-    /* 处理大页 */
 #ifdef CONFIG_HUGETLB_PAGE
-    if (pmd_huge(*pmd)) {
-        pr_warn(TAG "Huge page at 0x%llx, not supported\n", virt_addr);
+    if (pmd_huge(*pmd))
         return -EOPNOTSUPP;
-    }
 #endif
-
     ptep = pte_offset_map_lock(mm, pmd, virt_addr, &ptl);
     if (!ptep)
         return -ENOMEM;
-
     if (!pte_present(*ptep)) {
         pte_unmap_unlock(ptep, ptl);
         return -EFAULT;
     }
-
     *ptep_out = ptep;
-    if (pgd_out) *pgd_out = pgd;
-    if (p4d_out) *p4d_out = p4d;
-    if (pud_out) *pud_out = pud;
-    if (pmd_out) *pmd_out = pmd;
-
+    *ptl_out = ptl;
     return 0;
 }
 
@@ -443,43 +435,39 @@ static int pte_modify_for_track(struct pte_track_entry *entry)
     struct mm_struct *mm = entry->mm;
     uint64_t virt_addr = entry->virt_addr;
     pte_t *ptep;
+    spinlock_t *ptl;
     pte_t pte;
     int ret;
 
-    ret = pte_lookup_in_mm(mm, virt_addr, &ptep,
-                           &entry->pgd, &entry->p4d,
-                           &entry->pud, &entry->pmd);
-    if (ret < 0)
+    if (!mm)
+        return -EINVAL;
+
+    /*
+     * 关键修复：遍历/修改目标进程页表必须持有 mm->mmap_lock(read)，
+     * 否则目标进程并发 fork/exec/mmap/munmap 会释放页表 → use-after-free → panic。
+     * 这是原驱动"点初始化(装追踪)重启"的直接根因。
+     */
+    down_read(&mm->mmap_lock);
+    ret = pte_lock_pte(mm, virt_addr, &ptep, &ptl);
+    if (ret < 0) {
+        up_read(&mm->mmap_lock);
         return ret;
+    }
 
-    entry->ptep = ptep;
-
-    /* 保存原始PTE */
     pte = *ptep;
     entry->orig_pte = pte;
-
-    /* 提取物理页地址 */
     entry->page_pa = pte_pfn(pte) << PAGE_SHIFT;
     entry->page_size = PAGE_SIZE;
 
-    pr_debug(TAG "PTE at 0x%llx: orig=0x%016llx, pa=0x%llx, size=%u\n",
-            virt_addr, pte_val(pte), entry->page_pa, entry->page_size);
-
-    /* 使PTE无效 — 清除PTE_VALID (bit0) */
+    /* 使PTE无效（清除bit0），触发后续fault。
+     * 直接写 *ptep 以规避 set_pte_at 在 GKI(MTE+mmu_notifier) 下对未导出符号
+     * mte_sync_tags / __mmu_notifier_arch_invalidate_secondary_tlbs 的依赖。 */
     pte = clear_pte_bit(pte, __pgprot(PTE_VALID));
-    /* 直接写 PTE 指针，绕过 set_pte_at 宏：
-     * set_pte_at 在 ARM64 GKI（CONFIG_ARM64_MTE + mmu_notifier）会内联调用
-     * 未导出符号 mte_sync_tags / __mmu_notifier_arch_invalidate_secondary_tlbs，
-     * 外部模块编译时会 modpost undefined。
-     */
     *ptep = pte;
-    /* TLB刷新（flush_tlb_page 在 ARM64 GKI+MMU_NOTIFIER 会调用未导出符号
-     * __mmu_notifier_arch_invalidate_secondary_tlbs，外部模块无法编译，故此处跳过。
-     * PTE 修改本身属高危操作，后续应改用导出 API 或由内核侧完成。）
-     */
-    /* flush_tlb_page(find_vma(mm, virt_addr), virt_addr); */
 
-    /* 注意：ptep现在由entry持有，在卸载时解锁 */
+    pte_unmap_unlock(ptep, ptl);
+    up_read(&mm->mmap_lock);
+
     entry->installed = true;
     return 0;
 }
@@ -489,16 +477,28 @@ static int pte_modify_for_track(struct pte_track_entry *entry)
  */
 static int pte_restore_original(struct pte_track_entry *entry)
 {
-    if (!entry->installed || !entry->ptep)
+    struct mm_struct *mm = entry->mm;
+    pte_t *ptep;
+    spinlock_t *ptl;
+    int ret;
+
+    if (!entry->installed || !mm)
         return -EINVAL;
 
-    /* 恢复原始PTE */
-    *entry->ptep = entry->orig_pte;
-    /* TLB刷新跳过（同 pte_modify_for_track 原因，外部模块无法引用未导出 mmu_notifier 符号） */
-    /* flush_tlb_page(find_vma(mm, entry->virt_addr), entry->virt_addr); */
+    down_read(&mm->mmap_lock);
+    ret = pte_lock_pte(mm, entry->virt_addr, &ptep, &ptl);
+    if (ret < 0) {
+        up_read(&mm->mmap_lock);
+        return ret;
+    }
+    /* 仅当该PTE当前仍 present（未被并发重置）才恢复原始值 */
+    if (pte_present(*ptep))
+        *ptep = entry->orig_pte;
+
+    pte_unmap_unlock(ptep, ptl);
+    up_read(&mm->mmap_lock);
 
     entry->installed = false;
-    pr_debug(TAG "PTE restored for handle 0x%llx\n", entry->handle);
     return 0;
 }
 
@@ -585,133 +585,22 @@ static void pte_destroy_entry(struct pte_track_entry *entry)
     if (!entry)
         return;
 
-    /* 恢复PTE */
-    if (entry->installed && entry->ptep) {
-        *entry->ptep = entry->orig_pte;
-        spinlock_t *ptl = pte_lockptr(entry->mm, entry->pmd);
-        pte_unmap_unlock(entry->ptep, ptl);
-    }
+    /* 若仍装有追踪陷阱，先安全恢复PTE（内部走 mmap_lock + 短临界区） */
+    if (entry->installed)
+        pte_restore_original(entry);
 
     if (entry->mm)
         mmput(entry->mm);
     if (entry->task)
         put_task_struct(entry->task);
-
     kfree(entry);
 }
-
 /* ==================== 寄存器操作 ==================== */
 
-/*
- * 从当前上下文保存通用寄存器和浮点寄存器快照
- */
-static void pte_save_regs_snapshot(struct pte_track_entry *entry, struct pt_regs *regs)
-{
-    int i;
-    uint64_t *fpsimd_ptr;
-    struct user_fpsimd_state *fpsimd;
-
-    /* 通用寄存器 */
-    for (i = 0; i < 31; i++)
-        entry->hit.regs_info.regs[i] = regs->regs[i];
-    entry->hit.regs_info.sp = regs->sp;
-    entry->hit.regs_info.pc = regs->pc;
-    entry->hit.regs_info.pstate = regs->pstate;
-    entry->hit.regs_info.orig_x0 = regs->orig_x0;
-    entry->hit.regs_info.syscallno = regs->syscallno;
-
-    entry->hit.hit_addr = regs->pc;
-    entry->hit.hit_time = ktime_get_real_ns();
-    entry->hit.hit_count++;
-
-    /* 浮点寄存器 — 先从硬件同步到内存 */
-    /* [patched] fpsimd_save_state 是裸函数指针，在 handler/原子上下文调用高危，
-     * 且当前缺页kprobe已默认禁用。直接用当前线程的 fpsimd_state 内存读取即可。 */
-    fpsimd = &current->thread.uw.fpsimd_state;
-
-    /* 读取V0-V31 (128-bit) */
-    fpsimd_ptr = (uint64_t *)fpsimd->vregs;
-    for (i = 0; i < 32; i++) {
-        entry->hit.fpsimd_info.vregs[i] = *((__uint128_t *)(fpsimd_ptr + i * 2));
-    }
-    entry->hit.fpsimd_info.fpsr = fpsimd->fpsr;
-    entry->hit.fpsimd_info.fpcr = fpsimd->fpcr;
-}
-
-/*
- * 应用寄存器修改：修改通用寄存器或浮点寄存器
- */
-static int pte_apply_reg_modify(struct pte_track_entry *entry, struct pt_regs *regs)
-{
-    int i;
-    struct user_fpsimd_state *fpsimd;
-
-    if (entry->reg_config_count <= 0)
-        return 0;
-
-    fpsimd = &current->thread.uw.fpsimd_state;
-
-    for (i = 0; i < entry->reg_config_count; i++) {
-        struct reg_modify_config *cfg = &entry->reg_configs[i];
-        int idx = cfg->reg_index;
-
-        if (idx >= 0 && idx < 31) {
-            /* 通用寄存器 X0-X30 */
-            switch (cfg->reg_type) {
-            case 0: /* INT32 */
-                regs->regs[idx] = (regs->regs[idx] & 0xFFFFFFFF00000000ULL) |
-                                  (cfg->value.int32_val & 0xFFFFFFFFULL);
-                break;
-            case 1: /* INT64 */
-                regs->regs[idx] = cfg->value.int64_val;
-                break;
-            case 2: /* FLOAT */
-                *(float *)&regs->regs[idx] = cfg->value.float_val;
-                break;
-            case 3: /* DOUBLE */
-                *(double *)&regs->regs[idx] = cfg->value.double_val;
-                break;
-            default:
-                break;
-            }
-        } else if (idx == 31) {
-            /* SP */
-            regs->sp = cfg->value.int64_val;
-        } else if (idx >= 100 && idx <= 131) {
-            /* 浮点寄存器 V0-V31 (reg_index 100-131) */
-            int v_idx = idx - 100;
-            float *vreg_ptr = (float *)&fpsimd->vregs[v_idx];
-            switch (cfg->reg_type) {
-            case 0: /* INT32 */
-                *(int32_t *)vreg_ptr = cfg->value.int32_val;
-                break;
-            case 1: /* INT64 */
-                *(int64_t *)vreg_ptr = cfg->value.int64_val;
-                break;
-            case 2: /* FLOAT */
-                vreg_ptr[0] = cfg->value.float_val;
-                break;
-            case 3: /* DOUBLE */
-                *(double *)vreg_ptr = cfg->value.double_val;
-                break;
-            default:
-                break;
-            }
-        }
-    }
-
-    /* 标记浮点状态已修改，返回用户空间时重新加载 */
-    current->thread.fpsimd_cpu = NR_CPUS;
-    set_thread_flag(TIF_FOREIGN_FPSTATE);
-
-    return 0;
-}
-
 /* ==================== kprobe 缺页拦截 ==================== */
-
 /*
  * do_page_fault pre_handler
- * 在缺页处理之前检查是否是我们追踪的地址
+* 在缺页处理之前检查是否是我们追踪的地址
  */
 /* pre_handler: 让其自然携带与 kprobe_pre_handler_t 匹配的 KCFI typeid */
 static int pte_page_fault_pre_handler(struct kprobe *p, struct pt_regs *regs)
@@ -721,12 +610,11 @@ static int pte_page_fault_pre_handler(struct kprobe *p, struct pt_regs *regs)
     struct pt_regs *user_regs;
     struct pte_track_entry *entry;
     struct mm_struct *mm;
+    unsigned long irq_flags;
 
     if (!current || !current->mm)
         return 0; /* 内核线程，忽略 */
-
     mm = current->mm;
-
     /*
      * ARM64 do_page_fault 参数:
      *   x0 = far (fault address register)
@@ -737,65 +625,54 @@ static int pte_page_fault_pre_handler(struct kprobe *p, struct pt_regs *regs)
     esr = regs->regs[1];
     user_regs = (struct pt_regs *)regs->regs[2];
 
-    /* 快速过滤：检查fault地址是否在任何追踪页中 */
-    spin_lock(&track_list_lock);
+    /*
+     * kprobe handler 运行在缺页路径的原子/关抢占上下文。
+     * 必须遵守以下铁律：
+     *   1) 不得调用任何可能睡眠的函数（wake_up、find_vma、set_pte_at、
+     *      获取 mmap_lock、flush_tlb_page 等）。
+     *   2) 不得读写 do_page_fault 执行线程的浮点状态（fpsimd）或应用
+     *      寄存器修改——这些会破坏缺页现场，且部分函数不可重入。
+     *   3) 对 entry 的使用必须完全处在 track_list_lock 持有期间，
+     *      避免并发 UNINSTALL/free 造成的 use-after-free。
+     *  因此本 handler 只做：持 track_list_lock 查找命中页 + 在持锁
+     *  期间原子写入最小的命中标记（hit.fault_addr/handle/hit_ready）。
+     *  完整的寄存器快照与恢复统一交给用户态 ioctl（可睡眠上下文）。
+     */
+
+    /* 全程持有 track_list_lock，确保 entry 不会被并发释放 */
+    spin_lock_irqsave(&track_list_lock, irq_flags);
+
+    /* 在 track_list 中查找命中的追踪页（链表在 track_list_lock 保护下） */
     entry = pte_find_by_addr(mm, fault_addr);
-    spin_unlock(&track_list_lock);
+    if (!entry) {
+        spin_unlock_irqrestore(&track_list_lock, irq_flags);
+        return 0; /* 未命中，交给正常缺页处理 */
+    }
 
-    if (!entry)
-        return 0; /* 不匹配，正常处理缺页 */
-
-    /* 匹配！处理PTE追踪命中 */
-    pr_debug(TAG "PTE hit: handle=0x%llx, fault=0x%lx, pc=0x%llx\n",
-             entry->handle, fault_addr, user_regs->pc);
-
-    /* 保存命中信息 */
-    spin_lock(&entry->lock);
-
+    /* 命中：在持锁期间做最小化记录，避免任何浮点/重活 */
     entry->hit.fault_addr = fault_addr;
     entry->hit.fault_flags = (uint32_t)(esr & 0xFFFFFFFF);
     entry->hit.handle = entry->handle;
-
-    /* 保存寄存器快照 */
-    if (user_regs)
-        pte_save_regs_snapshot(entry, user_regs);
-
-    /* 应用寄存器修改 */
-    if (user_regs && entry->reg_config_count > 0)
-        pte_apply_reg_modify(entry, user_regs);
-
-    /* 恢复原始PTE（使后续访问正常） */
-    /* 注意：在kprobe handler中不能直接修改目标进程的页表。
-     * 我们标记需要恢复，实际操作延迟到用户层调用CMD_PTE_RESUME或
-     * 在post_handler中处理。这里我们保留PTE无效状态，
-     * 但设置一个标志让do_page_fault跳过此地址。
-     *
-     * 实际上，最简单的方法是在这里恢复PTE：
-     * set_pte_at(entry->mm, entry->virt_addr, entry->ptep, entry->orig_pte);
-     * flush_tlb_page(vma, entry->virt_addr);
-     * 但需要获取vma（可能需要mmap_lock，在kprobe上下文中危险）。
-     *
-     * 替代方案：让缺页处理正常返回（不恢复PTE），
-     * 在用户层获取命中信息后再调用CMD_PTE_RESUME来恢复。
-     * 此处我们使用kprobe来标记命中，然后让do_page_fault
-     * 自然失败（因为PTE无效），进程收到SIGSEGV。
-     *
-     * 更好的方案：恢复PTE并返回，让do_page_fault重试。
-     */
-
+    if (user_regs) {
+        /* 只记录通用寄存器 PC/SP 等最基本现场（不碰浮点状态） */
+        int i;
+        for (i = 0; i < 8; i++)
+            entry->hit.regs_info.regs[i] = user_regs->regs[i];
+        entry->hit.regs_info.pc = user_regs->pc;
+        entry->hit.regs_info.sp = user_regs->sp;
+        entry->hit.regs_info.pstate = user_regs->pstate;
+        entry->hit.hit_addr = user_regs->pc;
+    }
+    entry->hit.hit_time = ktime_get_real_ns();
+    entry->hit.hit_count++;
     entry->hit_ready = true;
-    spin_unlock(&entry->lock);
 
-    /* [patched] 危险块已移除：
-     * 原代码在 kprobe/原子上下文中调用了 wake_up_interruptible()（触发调度）、
-     * find_vma()（需要 mmap_lock 可能睡眠）、set_pte_at()+flush_tlb_page()
-     * （缺页路径改页表易死锁/递归缺页）。这些在开启 KASAN 的 6.6 内核上必然 panic。
-     *
-     * 现在 handler 只做：spinlock 查找 + 命中标记 + 寄存器快照/修改（纯内存操作，安全），
-     * PTE 恢复统一交给用户层 ioctl CMD_PTE_RESUME（在可睡眠的 ioctl 上下文执行，
-     * 调用 pte_restore_original）。这里不 wake_up、不 find_vma、不改页表。
-     */
-    return 0; /* 已标记命中，不在此恢复PTE；恢复交给 CMD_PTE_RESUME */
+    /* 注意：不在此处恢复 PTE，否则在原子上下文改页表易死锁/递归缺页。
+     * 恢复和寄存器修改一律由用户层 CMD_PTE_GET_HIT / CMD_PTE_RESUME
+     * 在可睡眠的 ioctl 上下文中完成。 */
+    spin_unlock_irqrestore(&track_list_lock, irq_flags);
+
+    return 0;
 }
 
 /* ==================== ioctl 处理 ==================== */
@@ -969,37 +846,32 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         struct pte_track_request req;
         struct pte_track_entry *entry;
         unsigned long irq_flags;
-
         if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
             return -EFAULT;
-
         spin_lock_irqsave(&track_list_lock, irq_flags);
         entry = pte_find_by_handle(req.handle);
         spin_unlock_irqrestore(&track_list_lock, irq_flags);
-
         if (!entry)
             return -EINVAL;
 
-        /* 重新修改PTE */
+        /*
+         * 重要：pte_modify_for_track 内部会 down_read(mm->mmap_lock)（睡眠锁），
+         * 绝不能在持有 entry->lock（自旋锁）时调用，否则 scheduling while atomic → 死锁/崩溃。
+         * 因此先把状态标志翻转为"准备恢复"，释放 entry->lock 后再做实际 PTE 修改。
+         */
         spin_lock(&entry->lock);
-        if (!entry->suspended) {
-            /* 如果未暂停，可能是之前命中了需要重新安装 */
-            ret = pte_modify_for_track(entry);
-        } else {
-            entry->suspended = false;
-            ret = pte_modify_for_track(entry);
-        }
+        entry->suspended = false;   /* 解除暂停标记，仅字节序原子写 */
         spin_unlock(&entry->lock);
 
+        /* 在可睡眠上下文重新安装追踪陷阱（内部持有 mmap_lock + pte 短临界区） */
+        ret = pte_modify_for_track(entry);
         if (ret < 0)
             return ret;
-
         pr_debug(TAG "Resumed PTE track: handle=0x%llx\n", req.handle);
         ret = 1;
         break;
     }
-
-    case CMD_PTE_SET_REG_MODIFY: {
+case CMD_PTE_SET_REG_MODIFY: {
         struct pte_track_entry *entry;
         uint32_t config_count;
         unsigned long irq_flags;
@@ -1080,34 +952,34 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         struct pte_track_request req;
         struct pte_track_entry *entry;
         unsigned long irq_flags;
-
         if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
             return -EFAULT;
-
         spin_lock_irqsave(&track_list_lock, irq_flags);
         entry = pte_find_by_handle(req.handle);
         spin_unlock_irqrestore(&track_list_lock, irq_flags);
-
         if (!entry)
             return -EINVAL;
 
+        /* 同上：pte_restore_original 内部 down_read(mmap_lock)，不能在持 entry->lock 时调用 */
         spin_lock(&entry->lock);
-        if (entry->installed) {
-            ret = pte_restore_original(entry);
-            if (ret == 0)
-                entry->suspended = true;
+        if (!entry->installed) {
+            spin_unlock(&entry->lock);
+            return 0;
         }
         spin_unlock(&entry->lock);
 
+        /* 在可睡眠上下文恢复原始 PTE */
+        ret = pte_restore_original(entry);
         if (ret < 0)
             return ret;
-
+        spin_lock(&entry->lock);
+        entry->suspended = true;    /* 暂停标记（此时 PTE 已恢复为原始） */
+        spin_unlock(&entry->lock);
         pr_debug(TAG "Suspended PTE track: handle=0x%llx\n", req.handle);
         ret = 1;
         break;
     }
-
-    case CMD_PTE_QUERY_PAGE: {
+case CMD_PTE_QUERY_PAGE: {
         struct pte_track_request req;
         struct task_struct *task;
         struct mm_struct *mm;
@@ -1129,30 +1001,31 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         }
         get_task_struct(task);
         rcu_read_unlock();
-
         mm = get_task_mm(task);
         put_task_struct(task);
         if (!mm)
             return -ESRCH;
 
-        lookup_ret = pte_lookup_in_mm(mm, req.virt_addr & PAGE_MASK,
-                                      &ptep, NULL, NULL, NULL, NULL);
-        if (lookup_ret < 0) {
-            mmput(mm);
-            return lookup_ret;
+        {
+            spinlock_t *ptl = NULL;
+            /* 页表遍历必须在 mm->mmap_lock 保护下进行，防止页表并发释放 */
+            down_read(&mm->mmap_lock);
+            lookup_ret = pte_lock_pte(mm, req.virt_addr & PAGE_MASK,
+                                      &ptep, &ptl);
+            if (lookup_ret < 0) {
+                up_read(&mm->mmap_lock);
+                mmput(mm);
+                return lookup_ret;
+            }
+            pte = *ptep;
+            req.page_pa = pte_pfn(pte) << PAGE_SHIFT;
+            req.page_size = PAGE_SIZE;
+            pte_unmap_unlock(ptep, ptl);
+            up_read(&mm->mmap_lock);
         }
-
-        pte = *ptep;
-        req.page_pa = pte_pfn(pte) << PAGE_SHIFT;
-        req.page_size = PAGE_SIZE;
-
-        spinlock_t *ptl = pte_lockptr(mm, NULL);
-        pte_unmap_unlock(ptep, ptl);
         mmput(mm);
-
         if (copy_to_user((void __user *)arg, &req, sizeof(req)))
             return -EFAULT;
-
         ret = 1;
         break;
     }
